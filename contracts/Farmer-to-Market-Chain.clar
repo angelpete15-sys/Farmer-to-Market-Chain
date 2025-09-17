@@ -7,10 +7,19 @@
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u105))
 (define-constant ERR_MARKET_NOT_FOUND (err u106))
 (define-constant ERR_INVALID_QUANTITY (err u107))
+(define-constant ERR_INSURANCE_NOT_FOUND (err u108))
+(define-constant ERR_POLICY_EXPIRED (err u109))
+(define-constant ERR_CLAIM_ALREADY_EXISTS (err u110))
+(define-constant ERR_INVALID_CLAIM_TYPE (err u111))
+(define-constant ERR_INSUFFICIENT_PREMIUM (err u112))
+(define-constant ERR_CLAIM_PERIOD_EXPIRED (err u113))
+(define-constant ERR_INVALID_PREMIUM_RATE (err u114))
 
 (define-data-var product-id-nonce uint u0)
 (define-data-var batch-id-nonce uint u0)
 (define-data-var transaction-id-nonce uint u0)
+(define-data-var insurance-policy-nonce uint u0)
+(define-data-var claim-id-nonce uint u0)
 
 (define-map farmers
     principal
@@ -97,12 +106,54 @@
 )
 (define-map product-reviews
     uint
-    (list 10
+    (list
+        10
         {
-        reviewer: principal,
-        rating: uint,
-        comment: (string-ascii 100),
-    })
+            reviewer: principal,
+            rating: uint,
+            comment: (string-ascii 100),
+        }
+    )
+)
+
+(define-map insurance-policies
+    uint
+    {
+        policy-holder: principal,
+        batch-id: uint,
+        coverage-amount: uint,
+        premium-paid: uint,
+        policy-start: uint,
+        policy-end: uint,
+        coverage-type: (string-ascii 30),
+        premium-rate: uint,
+        is-active: bool,
+    }
+)
+
+(define-map insurance-claims
+    uint
+    {
+        policy-id: uint,
+        claimant: principal,
+        claim-type: (string-ascii 30),
+        claim-amount: uint,
+        evidence: (string-ascii 200),
+        filed-at: uint,
+        status: (string-ascii 20),
+        payout-amount: uint,
+        processed-at: (optional uint),
+    }
+)
+
+(define-map insurance-pool
+    (string-ascii 30)
+    {
+        total-deposits: uint,
+        total-claims-paid: uint,
+        active-policies: uint,
+        base-premium-rate: uint,
+    }
 )
 
 (define-public (register-farmer
@@ -465,6 +516,146 @@
     )
 )
 
+(define-public (create-insurance-policy
+        (batch-id uint)
+        (coverage-amount uint)
+        (coverage-type (string-ascii 30))
+        (policy-duration uint)
+    )
+    (let (
+            (caller tx-sender)
+            (batch (unwrap! (map-get? product-batches batch-id) ERR_PRODUCT_NOT_FOUND))
+            (product (unwrap! (map-get? products (get product-id batch))
+                ERR_PRODUCT_NOT_FOUND
+            ))
+            (new-policy-id (+ (var-get insurance-policy-nonce) u1))
+            (base-rate (get-coverage-base-rate coverage-type))
+            (risk-multiplier (calculate-risk-multiplier product batch))
+            (premium-amount (/ (* (* coverage-amount base-rate) risk-multiplier) u10000))
+            (policy-start stacks-block-height)
+            (policy-end (+ policy-start policy-duration))
+        )
+        (asserts! (is-eq (get current-owner batch) caller) ERR_NOT_AUTHORIZED)
+        (asserts! (> coverage-amount u0) ERR_INVALID_QUANTITY)
+        (asserts! (> policy-duration u0) ERR_INVALID_STATUS)
+        (asserts! (>= base-rate u1) ERR_INVALID_PREMIUM_RATE)
+        (try! (stx-transfer? premium-amount caller (as-contract tx-sender)))
+        (map-set insurance-policies new-policy-id {
+            policy-holder: caller,
+            batch-id: batch-id,
+            coverage-amount: coverage-amount,
+            premium-paid: premium-amount,
+            policy-start: policy-start,
+            policy-end: policy-end,
+            coverage-type: coverage-type,
+            premium-rate: base-rate,
+            is-active: true,
+        })
+        (update-insurance-pool coverage-type premium-amount u0 true)
+        (var-set insurance-policy-nonce new-policy-id)
+        (ok new-policy-id)
+    )
+)
+
+(define-public (file-insurance-claim
+        (policy-id uint)
+        (claim-type (string-ascii 30))
+        (claim-amount uint)
+        (evidence (string-ascii 200))
+    )
+    (let (
+            (caller tx-sender)
+            (policy (unwrap! (map-get? insurance-policies policy-id)
+                ERR_INSURANCE_NOT_FOUND
+            ))
+            (new-claim-id (+ (var-get claim-id-nonce) u1))
+            (current-block stacks-block-height)
+        )
+        (asserts! (is-eq (get policy-holder policy) caller) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active policy) ERR_POLICY_EXPIRED)
+        (asserts! (< current-block (get policy-end policy)) ERR_POLICY_EXPIRED)
+        (asserts! (<= claim-amount (get coverage-amount policy))
+            ERR_INVALID_QUANTITY
+        )
+        (asserts! (> claim-amount u0) ERR_INVALID_QUANTITY)
+        (asserts!
+            (or
+                (is-eq claim-type "crop-failure")
+                (or
+                    (is-eq claim-type "quality-dispute")
+                    (or
+                        (is-eq claim-type "delivery-failure")
+                        (is-eq claim-type "weather-damage")
+                    )
+                )
+            )
+            ERR_INVALID_CLAIM_TYPE
+        )
+        (map-set insurance-claims new-claim-id {
+            policy-id: policy-id,
+            claimant: caller,
+            claim-type: claim-type,
+            claim-amount: claim-amount,
+            evidence: evidence,
+            filed-at: current-block,
+            status: "pending",
+            payout-amount: u0,
+            processed-at: none,
+        })
+        (var-set claim-id-nonce new-claim-id)
+        (ok new-claim-id)
+    )
+)
+
+(define-public (process-insurance-claim
+        (claim-id uint)
+        (approved bool)
+        (payout-amount uint)
+    )
+    (let (
+            (caller tx-sender)
+            (claim (unwrap! (map-get? insurance-claims claim-id) ERR_INSURANCE_NOT_FOUND))
+            (policy (unwrap! (map-get? insurance-policies (get policy-id claim))
+                ERR_INSURANCE_NOT_FOUND
+            ))
+            (current-block stacks-block-height)
+            (final-payout (if approved
+                payout-amount
+                u0
+            ))
+        )
+        (asserts! (is-eq caller CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (is-eq (get status claim) "pending") ERR_INVALID_STATUS)
+        (asserts! (<= payout-amount (get claim-amount claim))
+            ERR_INVALID_QUANTITY
+        )
+        (asserts! (<= payout-amount (get coverage-amount policy))
+            ERR_INVALID_QUANTITY
+        )
+        (if approved
+            (try! (as-contract (stx-transfer? final-payout tx-sender (get claimant claim))))
+            true
+        )
+        (map-set insurance-claims claim-id
+            (merge claim {
+                status: (if approved
+                    "approved"
+                    "denied"
+                ),
+                payout-amount: final-payout,
+                processed-at: (some current-block),
+            })
+        )
+        (if approved
+            (update-insurance-pool (get coverage-type policy) u0 final-payout
+                false
+            )
+            true
+        )
+        (ok true)
+    )
+)
+
 (define-read-only (get-farmer (farmer principal))
     (map-get? farmers farmer)
 )
@@ -594,4 +785,161 @@
 
 (define-read-only (get-market-purchases (market principal))
     (ok market)
+)
+
+(define-private (get-coverage-base-rate (coverage-type (string-ascii 30)))
+    (if (is-eq coverage-type "crop-failure")
+        u500
+        (if (is-eq coverage-type "quality-dispute")
+            u300
+            (if (is-eq coverage-type "delivery-failure")
+                u200
+                (if (is-eq coverage-type "weather-damage")
+                    u400
+                    u250
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (get-insurance-policy (policy-id uint))
+    (map-get? insurance-policies policy-id)
+)
+
+(define-read-only (get-insurance-claim (claim-id uint))
+    (map-get? insurance-claims claim-id)
+)
+
+(define-read-only (get-insurance-pool-stats (coverage-type (string-ascii 30)))
+    (map-get? insurance-pool coverage-type)
+)
+
+(define-read-only (calculate-premium-quote
+        (batch-id uint)
+        (coverage-amount uint)
+        (coverage-type (string-ascii 30))
+    )
+    (let (
+            (batch (unwrap! (map-get? product-batches batch-id) ERR_PRODUCT_NOT_FOUND))
+            (product (unwrap! (map-get? products (get product-id batch))
+                ERR_PRODUCT_NOT_FOUND
+            ))
+            (base-rate (get-coverage-base-rate coverage-type))
+            (risk-multiplier (calculate-risk-multiplier product batch))
+        )
+        (ok (/ (* (* coverage-amount base-rate) risk-multiplier) u10000))
+    )
+)
+
+(define-read-only (is-policy-active (policy-id uint))
+    (match (map-get? insurance-policies policy-id)
+        policy-data (and
+            (get is-active policy-data)
+            (< stacks-block-height (get policy-end policy-data))
+        )
+        false
+    )
+)
+
+(define-read-only (get-policy-coverage-remaining (policy-id uint))
+    (match (map-get? insurance-policies policy-id)
+        policy-data (if (is-policy-active policy-id)
+            (some (get coverage-amount policy-data))
+            none
+        )
+        none
+    )
+)
+
+(define-read-only (get-current-insurance-policy-id)
+    (var-get insurance-policy-nonce)
+)
+
+(define-read-only (get-current-claim-id)
+    (var-get claim-id-nonce)
+)
+
+(define-private (calculate-risk-multiplier
+        (product {
+            farmer: principal,
+            name: (string-ascii 50),
+            category: (string-ascii 30),
+            quantity: uint,
+            unit: (string-ascii 20),
+            harvest-date: uint,
+            expiry-date: uint,
+            price-per-unit: uint,
+            quality-grade: (string-ascii 10),
+            organic-certified: bool,
+            created-at: uint,
+            status: (string-ascii 20),
+        })
+        (batch {
+            product-id: uint,
+            batch-number: (string-ascii 30),
+            quantity: uint,
+            current-owner: principal,
+            origin-farmer: principal,
+            processing-date: (optional uint),
+            quality-tests: (list 5 (string-ascii 50)),
+            temperature-log: (list 10 uint),
+            location-history: (list 10 (string-ascii 100)),
+            status: (string-ascii 20),
+            created-at: uint,
+        })
+    )
+    (let (
+            (base-multiplier u100)
+            (quality-bonus (if (is-eq (get quality-grade product) "A")
+                u90
+                u100
+            ))
+            (organic-bonus (if (get organic-certified product)
+                u95
+                u100
+            ))
+            (freshness-factor (if (> (get expiry-date product) (+ stacks-block-height u1000))
+                u95
+                u110
+            ))
+        )
+        (/
+            (* (* base-multiplier quality-bonus)
+                (* organic-bonus freshness-factor)
+            )
+            u1000000
+        )
+    )
+)
+
+(define-private (update-insurance-pool
+        (coverage-type (string-ascii 30))
+        (premium-deposit uint)
+        (claim-payout uint)
+        (new-policy bool)
+    )
+    (let (
+            (current-pool (default-to {
+                total-deposits: u0,
+                total-claims-paid: u0,
+                active-policies: u0,
+                base-premium-rate: (get-coverage-base-rate coverage-type),
+            }
+                (map-get? insurance-pool coverage-type)
+            ))
+            (new-deposits (+ (get total-deposits current-pool) premium-deposit))
+            (new-claims (+ (get total-claims-paid current-pool) claim-payout))
+            (new-count (if new-policy
+                (+ (get active-policies current-pool) u1)
+                (get active-policies current-pool)
+            ))
+        )
+        (map-set insurance-pool coverage-type {
+            total-deposits: new-deposits,
+            total-claims-paid: new-claims,
+            active-policies: new-count,
+            base-premium-rate: (get base-premium-rate current-pool),
+        })
+    )
 )
