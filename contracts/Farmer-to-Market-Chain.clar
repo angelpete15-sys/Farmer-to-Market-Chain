@@ -943,3 +943,78 @@
         })
     )
 )
+
+(define-map batch-recalls
+    uint
+    {
+        batch-id: uint,
+        recalled-by: principal,
+        reason: (string-ascii 100),
+        recalled-at: uint,
+        active: bool,
+    }
+)
+
+(define-public (recall-batch
+        (batch-id uint)
+        (reason (string-ascii 100))
+    )
+    (let (
+            (caller tx-sender)
+            (batch (unwrap! (map-get? product-batches batch-id) ERR_PRODUCT_NOT_FOUND))
+            (existing (map-get? batch-recalls batch-id))
+        )
+        (asserts!
+            (or (is-eq (get current-owner batch) caller) (is-eq caller CONTRACT_OWNER))
+            ERR_NOT_AUTHORIZED
+        )
+        (match existing
+            rec (begin
+                (asserts! (not (get active rec)) ERR_INVALID_STATUS)
+                (map-set batch-recalls batch-id
+                    (merge rec {
+                        reason: reason,
+                        recalled-by: caller,
+                        recalled-at: stacks-block-height,
+                        active: true,
+                    })
+                )
+            )
+            (map-set batch-recalls batch-id {
+                batch-id: batch-id,
+                recalled-by: caller,
+                reason: reason,
+                recalled-at: stacks-block-height,
+                active: true,
+            })
+        )
+        (map-set product-batches batch-id (merge batch { status: "recalled" }))
+        (ok true)
+    )
+)
+
+(define-public (resolve-recall (batch-id uint))
+    (let (
+            (caller tx-sender)
+            (rec (unwrap! (map-get? batch-recalls batch-id) ERR_PRODUCT_NOT_FOUND))
+            (batch (unwrap! (map-get? product-batches batch-id) ERR_PRODUCT_NOT_FOUND))
+        )
+        (asserts!
+            (or (is-eq caller CONTRACT_OWNER) (is-eq (get current-owner batch) caller))
+            ERR_NOT_AUTHORIZED
+        )
+        (map-set batch-recalls batch-id (merge rec { active: false }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-batch-recall (batch-id uint))
+    (map-get? batch-recalls batch-id)
+)
+
+(define-read-only (is-batch-recalled (batch-id uint))
+    (match (map-get? batch-recalls batch-id)
+        rec (get active rec)
+        false
+    )
+)
