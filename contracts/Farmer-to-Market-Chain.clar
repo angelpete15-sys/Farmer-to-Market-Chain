@@ -14,6 +14,12 @@
 (define-constant ERR_INSUFFICIENT_PREMIUM (err u112))
 (define-constant ERR_CLAIM_PERIOD_EXPIRED (err u113))
 (define-constant ERR_INVALID_PREMIUM_RATE (err u114))
+(define-constant ERR_ESCROW_NOT_FOUND (err u120))
+(define-constant ERR_ESCROW_FORBIDDEN (err u121))
+(define-constant ERR_ESCROW_NOT_DEPOSITED (err u122))
+(define-constant ERR_ESCROW_ALREADY_FUNDED (err u123))
+(define-constant ERR_ESCROW_ALREADY_CLOSED (err u124))
+(define-constant ERR_ESCROW_DEADLINE_PASSED (err u125))
 
 (define-data-var product-id-nonce uint u0)
 (define-data-var batch-id-nonce uint u0)
@@ -1017,4 +1023,121 @@
         rec (get active rec)
         false
     )
+)
+
+(define-data-var escrow-id-nonce uint u0)
+
+(define-map escrows
+    uint
+    {
+        batch-id: uint,
+        seller: principal,
+        buyer: principal,
+        price: uint,
+        deadline: uint,
+        deposited: bool,
+        released: bool,
+        cancelled: bool,
+    }
+)
+
+(define-public (create-escrow-sale
+        (batch-id uint)
+        (buyer principal)
+        (price uint)
+        (deadline uint)
+    )
+    (let (
+            (caller tx-sender)
+            (batch (unwrap! (map-get? product-batches batch-id) ERR_PRODUCT_NOT_FOUND))
+            (new-escrow-id (+ (var-get escrow-id-nonce) u1))
+            (current-block stacks-block-height)
+        )
+        (asserts! (is-eq (get current-owner batch) caller) ERR_NOT_AUTHORIZED)
+        (asserts! (> price u0) ERR_INVALID_QUANTITY)
+        (asserts! (>= deadline current-block) ERR_INVALID_STATUS)
+        (asserts! (not (is-batch-recalled batch-id)) ERR_INVALID_STATUS)
+        (map-set escrows new-escrow-id {
+            batch-id: batch-id,
+            seller: caller,
+            buyer: buyer,
+            price: price,
+            deadline: deadline,
+            deposited: false,
+            released: false,
+            cancelled: false,
+        })
+        (var-set escrow-id-nonce new-escrow-id)
+        (ok new-escrow-id)
+    )
+)
+
+(define-public (deposit-escrow (escrow-id uint))
+    (let (
+            (caller tx-sender)
+            (escrow (unwrap! (map-get? escrows escrow-id) ERR_ESCROW_NOT_FOUND))
+            (current-block stacks-block-height)
+        )
+        (asserts! (is-eq caller (get buyer escrow)) ERR_ESCROW_FORBIDDEN)
+        (asserts! (not (get cancelled escrow)) ERR_ESCROW_ALREADY_CLOSED)
+        (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_CLOSED)
+        (asserts! (not (get deposited escrow)) ERR_ESCROW_ALREADY_FUNDED)
+        (asserts! (<= current-block (get deadline escrow))
+            ERR_ESCROW_DEADLINE_PASSED
+        )
+        (try! (stx-transfer? (get price escrow) caller (as-contract tx-sender)))
+        (map-set escrows escrow-id (merge escrow { deposited: true }))
+        (ok true)
+    )
+)
+
+(define-public (release-escrow-payment (escrow-id uint))
+    (let (
+            (caller tx-sender)
+            (escrow (unwrap! (map-get? escrows escrow-id) ERR_ESCROW_NOT_FOUND))
+            (current-block stacks-block-height)
+        )
+        (asserts! (is-eq caller (get buyer escrow)) ERR_ESCROW_FORBIDDEN)
+        (asserts! (get deposited escrow) ERR_ESCROW_NOT_DEPOSITED)
+        (asserts! (not (get cancelled escrow)) ERR_ESCROW_ALREADY_CLOSED)
+        (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_CLOSED)
+        (asserts! (<= current-block (get deadline escrow))
+            ERR_ESCROW_DEADLINE_PASSED
+        )
+        (try! (as-contract (stx-transfer? (get price escrow) tx-sender (get seller escrow))))
+        (map-set escrows escrow-id (merge escrow { released: true }))
+        (ok true)
+    )
+)
+
+(define-public (cancel-escrow (escrow-id uint))
+    (let (
+            (caller tx-sender)
+            (escrow (unwrap! (map-get? escrows escrow-id) ERR_ESCROW_NOT_FOUND))
+            (current-block stacks-block-height)
+        )
+        (asserts!
+            (or (is-eq caller (get buyer escrow)) (is-eq caller (get seller escrow)))
+            ERR_ESCROW_FORBIDDEN
+        )
+        (asserts! (not (get cancelled escrow)) ERR_ESCROW_ALREADY_CLOSED)
+        (asserts! (not (get released escrow)) ERR_ESCROW_ALREADY_CLOSED)
+        (asserts! (> current-block (get deadline escrow))
+            ERR_ESCROW_DEADLINE_PASSED
+        )
+        (if (get deposited escrow)
+            (try! (as-contract (stx-transfer? (get price escrow) tx-sender (get buyer escrow))))
+            true
+        )
+        (map-set escrows escrow-id (merge escrow { cancelled: true }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+    (map-get? escrows escrow-id)
+)
+
+(define-read-only (get-current-escrow-id)
+    (var-get escrow-id-nonce)
 )
